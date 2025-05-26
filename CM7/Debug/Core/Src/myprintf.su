@@ -1,2 +1,0 @@
-../Core/Src/myprintf.c:9:1:__io_putchar	16	static
-../Core/Src/myprintf.c:15:1:__io_getchar	16	static
