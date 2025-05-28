@@ -1422,6 +1422,9 @@ void StartControlTask(void *argument)
 
   double max_integral_action_val = 999999999999999;
 
+  float tau = 0.05; //Low pass filter time constant (time it takes to reach 63.2% of the new velocity reading value
+  float alpha = 0.0; // Low pass filter alpha value = dt / (tau + dt)
+
   /* Infinite loop */
   for(;;)
   {
@@ -1431,36 +1434,38 @@ void StartControlTask(void *argument)
 /*------------------------------------------------------------------------*/
 /******* 1. Get angular position and velocity with encoders & IMU *********/
     if (!simulation_on) {
-		enc->cnt_vals[0] = TIM1->CNT; enc->cnt_vals[1] = TIM2->CNT; enc->cnt_vals[2] = TIM4->CNT; enc->cnt_vals[3] = TIM8->CNT;
+		enc->cnt_vals[0] = TIM1->CNT; enc->cnt_vals[1] = TIM4->CNT; enc->cnt_vals[2] = TIM8->CNT; enc->cnt_vals[3] = TIM2->CNT;
 
 		BNO055_EulerVector = bno055_getVectorEuler();
 		imu->yaw = BNO055_EulerVector.x;  imu->roll = BNO055_EulerVector.y;  imu->pitch = BNO055_EulerVector.z;
 
-		// Calculate counter difference, considering wrap-around
-		deltaEncCounts[0] = computeDeltaCNT(enc->cnt_vals[0], enc->prevcnt_vals[0]);
-		deltaEncCounts[1] = computeDeltaCNT(enc->cnt_vals[1], enc->prevcnt_vals[1]);
-		deltaEncCounts[2] = computeDeltaCNT(enc->cnt_vals[2], enc->prevcnt_vals[2]);
-		deltaEncCounts[3] = computeDeltaCNT(enc->cnt_vals[3], enc->prevcnt_vals[3]);
-	//	printf("TIM1: %d TIM2: %d TIM4: %d TIM8: %d \r\n", CNT_Vals[0],CNT_Vals[1],CNT_Vals[2],CNT_Vals[3]);
-		enc->prevcnt_vals[0] = enc->cnt_vals[0]; enc->prevcnt_vals[1] = enc->cnt_vals[1]; enc->prevcnt_vals[2] = enc->cnt_vals[2]; enc->prevcnt_vals[3] = enc->cnt_vals[3];
+		for (int i = 0; i < 4; i++) {
+		    // Calculate counter difference considering wrap-around
+		    deltaEncCounts[i] = computeDeltaCNT(enc->cnt_vals[i], enc->prevcnt_vals[i]);
 
-		// Update total angle value
-		enc->angleVals[0] += deltaEncCounts[0] * Degs_per_count;
-		enc->angleVals[1] += deltaEncCounts[1] * Degs_per_count;
-		enc->angleVals[2] += deltaEncCounts[2] * Degs_per_count;
-		enc->angleVals[3] += deltaEncCounts[3] * Degs_per_count;
+		    // Save current count for next iteration
+		    enc->prevcnt_vals[i] = enc->cnt_vals[i];
+
+		    // Update total angle value
+		    enc->angleVals[i] += deltaEncCounts[i] * Degs_per_count;
+		}
 
 		// Calculate velocities
 		ts->print_prev = ts->previous;
 		ts->current = osKernelGetTickCount();
 		ts->delta = ts->current - ts->previous;
 		ts->previous = ts->current;
+		dt = ts->delta / 1000.0f;  // Convert ms to seconds
 		//	printf(" currentTime: %lu prevTime: %lu deltaTime: %lu", currentTime, prevTime, deltaTime);
 
-		enc->omegaVals[0] = deltaEncCounts[0] * Rads_per_count /  (ts->delta / 1000.0f) / (2*PI);
-		enc->omegaVals[1] = deltaEncCounts[1] * Rads_per_count /  (ts->delta / 1000.0f) / (2*PI);
-		enc->omegaVals[2] = deltaEncCounts[2] * Rads_per_count /  (ts->delta / 1000.0f) / (2*PI);
-		enc->omegaVals[3] = deltaEncCounts[3] * Rads_per_count /  (ts->delta / 1000.0f) / (2*PI);
+		//******* GET VELOCITIES WITH FIRST ORDER FILTER****//
+		alpha = dt / (tau + dt);
+		for (uint8_t i = 0; i < 4; i++){
+			double rawRPM = (deltaEncCounts[i] * Rads_per_count /  (ts->delta / 1000.0f) / (2*PI));
+			enc->omegaVals[i] = alpha * rawRPM + (1.0 - alpha) * enc->omegaVals[i];
+		}
+
+
     } else {
 		BNO055_EulerVector = bno055_getVectorEuler();
 		imu->yaw = BNO055_EulerVector.x;  imu->roll = BNO055_EulerVector.y;  imu->pitch = BNO055_EulerVector.z;
@@ -1471,15 +1476,15 @@ void StartControlTask(void *argument)
 		ts->previous = ts->current;
 
 		// Simple first-order simulation model: omega approaches u with time
-		float tau = 0.1f;  // time constant for motor response
-		float alpha = ts->delta / (1000.0f * tau + ts->delta);  // convert delta to seconds
+		float tau_2 = 0.1f;  // time constant for motor response
+		float alpha_2 = ts->delta / (1000.0f * tau_2 + ts->delta);  // convert delta to seconds
 
     	for (int i = 0; i < 4; i++) {
-    	    enc->omegaVals[i] = (1 - alpha) * enc->omegaVals[i] + alpha * ctrl_out->u[i];
+    	    enc->omegaVals[i] = (1 - alpha_2) * enc->omegaVals[i] + alpha_2 * ctrl_out->u[i];
 
     	    // Update total angle by integrating omega
-    	    float dt = ts->delta / 1000.0f;  // ms to s
-    	    enc->angleVals[i] += enc->omegaVals[i] * dt;
+    	    float dt_2 = ts->delta / 1000.0f;  // ms to s
+    	    enc->angleVals[i] += enc->omegaVals[i] * dt_2;
 
     	    // Simulate counts from angle
     	    enc->cnt_vals[i] = (uint16_t)(enc->angleVals[i] / Degs_per_count) % 65536;
@@ -1580,17 +1585,23 @@ void StartControlTask(void *argument)
 //			sumKI_u_errs[i] = 0; // Reset Integral part if error small
 //		}
 
-		if (ctrl_out->PWM_vals[i] < 0){
-			ctrl_out->M_dirs[i] = 1;
-			if (ctrl_out->PWM_vals[i] < 0 && ctrl_out->PWM_vals[i] > - deadzone_duty_lim) ctrl_out->PWM_vals[i] = -deadzone_duty_lim;
-			else if (ctrl_out->PWM_vals[i] < -max_duty_cycle) ctrl_out->PWM_vals[i] = -max_duty_cycle;
-			ctrl_out->dutyCycles[i] = (uint16_t)(ctrl_out->PWM_vals[i]*-1);
+		if (ctrl_out->u[i] < 0.005 && ctrl_out->u[i] > -0.005) {
+			ctrl_out->PWM_vals[i] = 0;
+			ctrl_out->dutyCycles[i] = (uint16_t)0;
 		}
-		else if (ctrl_out->PWM_vals[i] >= 0){
-			ctrl_out->M_dirs[i] = 0;
-			if (ctrl_out->PWM_vals[i] > 0 && ctrl_out->PWM_vals[i] < deadzone_duty_lim) ctrl_out->PWM_vals[i] = deadzone_duty_lim;
-			else if (ctrl_out->PWM_vals[i] > max_duty_cycle) ctrl_out->PWM_vals[i] = max_duty_cycle;
-			ctrl_out->dutyCycles[i] = (uint16_t)(ctrl_out->PWM_vals[i]);
+		else {
+			if (ctrl_out->PWM_vals[i] < 0){
+				ctrl_out->M_dirs[i] = 1;
+				if (ctrl_out->PWM_vals[i] < 0 && ctrl_out->PWM_vals[i] > - deadzone_duty_lim) ctrl_out->PWM_vals[i] = -deadzone_duty_lim;
+				else if (ctrl_out->PWM_vals[i] < -max_duty_cycle) ctrl_out->PWM_vals[i] = -max_duty_cycle;
+				ctrl_out->dutyCycles[i] = (uint16_t)(ctrl_out->PWM_vals[i]*-1);
+			}
+			else if (ctrl_out->PWM_vals[i] >= 0){
+				ctrl_out->M_dirs[i] = 0;
+				if (ctrl_out->PWM_vals[i] > 0 && ctrl_out->PWM_vals[i] < deadzone_duty_lim) ctrl_out->PWM_vals[i] = deadzone_duty_lim;
+				else if (ctrl_out->PWM_vals[i] > max_duty_cycle) ctrl_out->PWM_vals[i] = max_duty_cycle;
+				ctrl_out->dutyCycles[i] = (uint16_t)(ctrl_out->PWM_vals[i]);
+			}
 		}
 	}
 
@@ -1613,7 +1624,6 @@ void StartControlTask(void *argument)
 
 	globalSpeedsFromU(odom->phi, data.d, data.r, enc->omegaVals, odom->q_dot); // q_dot = {phi_dot, x_dot, y_dot}
 //	globalSpeedsFromU(odom->phi, data.d, data.r, ctrl_out->u, odom->q_dot); // q_dot = {phi_dot, x_dot, y_dot}
-	dt = ts->delta / 1000.0f;  // Convert ms to seconds
 
 	odom->phi    += odom->q_dot[0] * dt;         // Integrated angular velocity
 	odom->x_pos  += odom->q_dot[1] * dt;         // Integrated x velocity (global)
